@@ -1,0 +1,15 @@
+[registries.crates-io]
+protocol = "sparse"
+
+[package]
+name = "vulkano_compute"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+opt-level = 1
+
+[dependencies]
+vulkano = "0.31.0"
+vulkano-shaders = "0.31.0"
+
