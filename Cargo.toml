@@ -10,6 +10,7 @@ edition = "2021"
 opt-level = 1
 
 [dependencies]
+clap = { version = "4.1.13", features = ["derive"] }
 vulkano = "0.31.0"
 vulkano-shaders = "0.31.0"
 

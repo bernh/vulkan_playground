@@ -1,13 +1,16 @@
 use std::sync::Arc;
+use std::{thread, time};
 
-use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
+use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer, DeviceLocalBuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
-use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo};
 use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineBindPoint};
 use vulkano::sync::{self, GpuFuture};
 use vulkano::VulkanLibrary;
+
+use clap::Parser;
 
 mod cs {
     vulkano_shaders::shader! {
@@ -30,6 +33,7 @@ void main() {
 
 struct VulkanoComputeApp {
     instance: Arc<Instance>,
+    // physical: Arc<PhysicalDevice>,
     device: Arc<Device>,
     queue: Arc<Queue>,
     queue_family_index: u32,
@@ -59,6 +63,11 @@ impl VulkanoComputeApp {
         let (device, mut queues) = Device::new(
             physical,
             DeviceCreateInfo {
+                enabled_extensions: DeviceExtensions {
+                    khr_external_memory: true,
+                    khr_external_memory_fd: true,
+                    ..Default::default()
+                },
                 // here we pass the desired queue family to use by index
                 queue_create_infos: vec![QueueCreateInfo {
                     queue_family_index,
@@ -137,7 +146,7 @@ impl VulkanoComputeApp {
         println!("buffer copy successfully ran!");
     }
 
-    fn compute_shader_1(&self) {
+    fn compute_shader(&self) {
         // create a buffer with values
         let data_iter = 0..65536;
         let data_buffer = CpuAccessibleBuffer::from_iter(
@@ -204,10 +213,114 @@ impl VulkanoComputeApp {
 
         println!("compute shader successfully ran!");
     }
+
+    fn inter_process_com_writer(&self) {
+        // Simple iterator to construct test data.
+        let data = (0..10_000).map(|i| i as f32);
+
+        // Create a CPU accessible buffer initialized with the data.
+        let temporary_accessible_buffer = CpuAccessibleBuffer::from_iter(
+            self.device.clone(),
+            BufferUsage {
+                transfer_src: true,
+                ..BufferUsage::empty()
+            }, // Specify this buffer will be used as a transfer source.
+            false,
+            data,
+        )
+        .unwrap();
+
+        let device_local_buffer = unsafe {
+            DeviceLocalBuffer::<[f32]>::raw_with_exportable_fd(
+                self.device.clone(),
+                10_000 as vulkano::DeviceSize,
+                BufferUsage {
+                    storage_buffer: true,
+                    transfer_dst: true,
+                    ..BufferUsage::empty()
+                }, // Specify use as a storage buffer and transfer destination.
+                self.device.active_queue_family_indices().iter().copied(),
+            )
+            .expect("Failed to allocate device local buffer")
+        };
+
+        let fd = device_local_buffer.export_posix_fd().unwrap();
+        println!("File descriptor for GPU memory: {:?}", fd);
+
+        // Create a one-time command to copy between the buffers.
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.device.clone(),
+            self.queue_family_index,
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        builder
+            .copy_buffer(CopyBufferInfo::buffers(
+                temporary_accessible_buffer,
+                device_local_buffer.clone(),
+            ))
+            .unwrap();
+
+        let command_buffer = builder.build().unwrap();
+
+        // Execute copy command and wait for completion before proceeding.
+        let future = sync::now(self.device.clone())
+            .then_execute(self.queue.clone(), command_buffer)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap();
+
+        future.wait(None).unwrap();
+
+        println!("Copied 10000 floats to a GPU buffer");
+    }
+
+    fn inter_process_com_reader(&self) {
+        // Create a CPU accessible buffer
+        let data = (0..10_000).map(|_| 0 as f32);
+        let _read_back_buffer = CpuAccessibleBuffer::<[f32]>::from_iter(
+            self.device.clone(),
+            BufferUsage {
+                transfer_dst: true,
+                ..BufferUsage::empty()
+            },
+            false,
+            data,
+        )
+        .unwrap();
+    }
+}
+
+#[derive(clap::Parser)]
+#[command()]
+struct Cli {
+    #[arg(short, long)]
+    reader: bool,
 }
 
 fn main() {
+    let cli = Cli::parse();
+
     let app = VulkanoComputeApp::initialize();
+
     app.buffer_copy();
-    app.compute_shader_1();
+    app.compute_shader();
+    {
+        // test GPU shared memory communication between processes
+        let extensions = app.device.enabled_extensions();
+        if extensions.khr_external_memory && extensions.khr_external_memory_fd {
+            println!("Looks like all extensions for external memory handling are available")
+        } else {
+            panic!("Necessary extensions for external memory handling not available!")
+        }
+
+        if cli.reader {
+            app.inter_process_com_reader();
+        } else {
+            app.inter_process_com_writer();
+            thread::sleep(time::Duration::from_secs(50));
+            println!("done");
+        }
+    }
 }
